@@ -26,6 +26,7 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -45,14 +46,18 @@ import com.google.android.gms.ads.LoadAdError
 import com.google.android.gms.ads.MobileAds
 import com.google.android.gms.ads.interstitial.InterstitialAd
 import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback
+import com.google.android.gms.ads.rewarded.RewardedAd
+import com.google.android.gms.ads.rewarded.RewardedAdLoadCallback
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private var mInterstitialAd: InterstitialAd? = null
+    private var mRewardedAd: RewardedAd? = null
     private var articleClickCount = 0
     private var isReturningFromArticle = false
+    private lateinit var viewModel: MainViewModel
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -61,12 +66,13 @@ class MainActivity : ComponentActivity() {
         CoroutineScope(Dispatchers.IO).launch {
             MobileAds.initialize(this@MainActivity) {
                 loadInterstitialAd()
+                loadRewardedAd()
             }
         }
 
         enableEdgeToEdge()
         setContent {
-            val viewModel: MainViewModel = viewModel()
+            viewModel = viewModel()
             val isDarkMode by viewModel.isDarkMode.collectAsStateWithLifecycle()
             
             MatomewebTheme(darkTheme = isDarkMode) {
@@ -75,6 +81,9 @@ class MainActivity : ComponentActivity() {
                     onArticleClicked = {
                         articleClickCount++
                         isReturningFromArticle = true
+                    },
+                    onWatchAdClicked = {
+                        showRewardedAd(viewModel)
                     }
                 )
             }
@@ -95,8 +104,40 @@ class MainActivity : ComponentActivity() {
             })
     }
 
+    private fun loadRewardedAd() {
+        val adRequest = AdRequest.Builder().build()
+        // 本番用リワード広告ID
+        RewardedAd.load(this, "ca-app-pub-8950375321788767/2502982782", adRequest,
+            object : RewardedAdLoadCallback() {
+                override fun onAdFailedToLoad(adError: LoadAdError) {
+                    mRewardedAd = null
+                    // 失敗した場合は30秒後に再試行
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        loadRewardedAd()
+                    }, 30000)
+                }
+
+                override fun onAdLoaded(rewardedAd: RewardedAd) {
+                    mRewardedAd = rewardedAd
+                }
+            })
+    }
+
+    private fun showRewardedAd(viewModel: MainViewModel) {
+        mRewardedAd?.let { ad ->
+            ad.show(this) { rewardItem ->
+                viewModel.setAdFreeFor24Hours()
+                loadRewardedAd() // 次のためにロード
+            }
+        } ?: run {
+            // 広告がロードされていない場合の処理（トースト表示など）
+            android.widget.Toast.makeText(this, "広告の準備ができていません。しばらく待ってからお試しください。", android.widget.Toast.LENGTH_SHORT).show()
+            loadRewardedAd()
+        }
+    }
+
     private fun showInterstitialAd() {
-        if (mInterstitialAd != null && articleClickCount >= 5) {
+        if (!viewModel.isAdFree.value && mInterstitialAd != null && articleClickCount >= 5) {
             mInterstitialAd?.show(this)
             articleClickCount = 0
             loadInterstitialAd()
@@ -114,10 +155,11 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MainScreen(viewModel: MainViewModel, onArticleClicked: () -> Unit) {
+fun MainScreen(viewModel: MainViewModel, onArticleClicked: () -> Unit, onWatchAdClicked: () -> Unit) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val favorites by viewModel.favorites.collectAsStateWithLifecycle(initialValue = emptyList())
     val allSources by viewModel.allSources.collectAsStateWithLifecycle(initialValue = emptyList())
+    val isAdFree by viewModel.isAdFree.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var selectedTab by remember { mutableIntStateOf(0) }
     
@@ -194,10 +236,12 @@ fun MainScreen(viewModel: MainViewModel, onArticleClicked: () -> Unit) {
                 when (selectedTab) {
                     0 -> ArticleListScreen(uiState, viewModel, articleListState, onArticleClicked)
                     1 -> FavoriteListScreen(favorites, context, viewModel, onArticleClicked)
-                    2 -> SettingsScreen(allSources, viewModel)
+                    2 -> SettingsScreen(allSources, viewModel, onWatchAdClicked)
                 }
             }
-            BannerAdView()
+            if (!isAdFree) {
+                BannerAdView()
+            }
         }
     }
 }
@@ -289,11 +333,12 @@ fun FavoriteListScreen(favorites: List<FavoriteArticle>, context: android.conten
 }
 
 @Composable
-fun SettingsScreen(sources: List<SubscriptionSource>, viewModel: MainViewModel) {
+fun SettingsScreen(sources: List<SubscriptionSource>, viewModel: MainViewModel, onWatchAdClicked: () -> Unit) {
     var showAddDialog by remember { mutableStateOf(false) }
     val catalog = viewModel.sourceCatalog
     val subscribedUrls = sources.map { it.url }.toSet()
     val isDarkMode by viewModel.isDarkMode.collectAsStateWithLifecycle()
+    val isAdFree by viewModel.isAdFree.collectAsStateWithLifecycle()
 
     Scaffold(
         floatingActionButton = {
@@ -319,6 +364,22 @@ fun SettingsScreen(sources: List<SubscriptionSource>, viewModel: MainViewModel) 
                             checked = isDarkMode,
                             onCheckedChange = { viewModel.toggleDarkMode(it) }
                         )
+                    }
+                )
+            }
+            item {
+                ListItem(
+                    headlineContent = { Text("広告を非表示にする") },
+                    supportingContent = { 
+                        Text(if (isAdFree) "現在広告非表示モードです" else "動画広告を視聴して、長時間、広告なしで楽しめます")
+                    },
+                    trailingContent = {
+                        Button(
+                            onClick = onWatchAdClicked,
+                            enabled = !isAdFree
+                        ) {
+                            Text(if (isAdFree) "適用中" else "視聴")
+                        }
                     }
                 )
             }

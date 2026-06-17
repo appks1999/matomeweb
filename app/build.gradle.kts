@@ -13,8 +13,8 @@ android {
         applicationId = "com.akito.matomeweb"
         minSdk = 24
         targetSdk = 36
-        versionCode = 2
-        versionName = "1.0.1"
+        versionCode = 4
+        versionName = "1.1.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -52,6 +52,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation("androidx.fragment:fragment-ktx:1.8.5")
     implementation(libs.rssparser)
     implementation(libs.coil.compose)
     implementation(libs.play.services.ads)

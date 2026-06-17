@@ -26,12 +26,34 @@ sealed class MainUiState {
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val parser = RssParser()
     private val dao = AppDatabase.getDatabase(application).appDao()
+    private val prefs = application.getSharedPreferences("app_prefs", android.content.Context.MODE_PRIVATE)
     
     private val _rawArticles = MutableStateFlow<List<Article>>(emptyList())
     private val _nativeAds = MutableStateFlow<List<NativeAd>>(emptyList())
     private val _isLoading = MutableStateFlow(false)
     private val _errorMessage = MutableStateFlow<String?>(null)
     
+    private val _isAdFree = MutableStateFlow(false)
+    val isAdFree: StateFlow<Boolean> = _isAdFree.asStateFlow()
+
+    private fun checkAdFreeStatus() {
+        val until = prefs.getLong("ad_free_until", 0L)
+        _isAdFree.value = System.currentTimeMillis() < until
+    }
+
+    fun setAdFreeFor24Hours() {
+        val duration = 2 * 60 * 60 * 1000L // 2時間
+        val until = System.currentTimeMillis() + duration
+        prefs.edit().putLong("ad_free_until", until).apply()
+        _isAdFree.value = true
+        
+        // 指定時間後に自動でフラグを戻す
+        viewModelScope.launch {
+            delay(duration)
+            _isAdFree.value = false
+        }
+    }
+
     private val _isDarkMode = MutableStateFlow(false)
     val isDarkMode: StateFlow<Boolean> = _isDarkMode.asStateFlow()
 
@@ -48,7 +70,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         readLinks, 
         _nativeAds, 
         _isLoading, 
-        _errorMessage
+        _errorMessage,
+        isAdFree // 広告非表示フラグを追加
     ) { flowArray ->
         val articles = flowArray[0] as List<Article>
         val favs = flowArray[1] as List<FavoriteArticle>
@@ -56,6 +79,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val ads = flowArray[3] as List<NativeAd>
         val loading = flowArray[4] as Boolean
         val error = flowArray[5] as? String
+        val adFree = flowArray[6] as Boolean
 
         if (error != null) {
             MainUiState.Error(error)
@@ -74,7 +98,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val mixedItems = mutableListOf<MainListItem>()
             updatedArticles.forEachIndexed { index, article ->
                 mixedItems.add(MainListItem.ArticleItem(article))
-                if ((index + 1) % 10 == 0 && ads.isNotEmpty()) {
+                // 広告非表示モードでない場合のみ、10記事ごとに広告を挿入
+                if (!adFree && (index + 1) % 10 == 0 && ads.isNotEmpty()) {
                     val adIndex = ((index + 1) / 10 - 1) % ads.size
                     mixedItems.add(MainListItem.AdItem(ads[adIndex]))
                 }
@@ -106,6 +131,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     init {
+        checkAdFreeStatus()
         viewModelScope.launch {
             val currentSources = dao.getAllSources().first()
             if (currentSources.isEmpty()) {
@@ -173,37 +199,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun extractImageUrl(item: com.prof18.rssparser.model.RssItem): String? {
-        val rawContent = "${item.description ?: ""} ${item.content ?: ""} ${item.image ?: ""}"
-        if (rawContent.isBlank()) return null
+        var rawHtml = (item.description ?: "") + (item.content ?: "")
+        if (rawHtml.isBlank()) return item.image
 
-        val text = rawContent
-            .replace("&lt;", "<").replace("&gt;", ">")
-            .replace("&quot;", "\"").replace("&amp;", "&")
-            .replace("&#39;", "'").replace("&#039;", "'")
+        // エスケープ解除（重要）
+        if (rawHtml.contains("&lt;")) {
+            rawHtml = rawHtml.replace("&lt;", "<").replace("&gt;", ">")
+                .replace("&quot;", "\"").replace("&amp;", "&")
+        }
 
-        val urlRegex = """(?:https?:)?//[^\s"'<>]+?\.(?:jpg|jpeg|png|webp|gif)[^\s"'<>]*""".toRegex(RegexOption.IGNORE_CASE)
-        val matches = urlRegex.findAll(text).map { it.value }.toList()
+        val doc = org.jsoup.Jsoup.parse(rawHtml)
+        val imgs = doc.select("img")
+        val preferred = listOf("blogimg.jp", "archives", "imgs", "image", "upload", "fc2.com")
+        val ignore = listOf("pixel", "counter", "tracking", "ads.", "favicon", "clap", "emoji")
 
-        if (matches.isEmpty()) return null
-
-        val preferredPatterns = listOf("blogimg.jp", "archives", "imgs", "image", "upload")
-        val ignorePatterns = listOf("pixel", "counter", "tracking", "ads.", "favicon", "clap", "emoji", "parts/img/db")
-
-        val sortedCandidates = matches.map { match ->
-            var url = match
-            if (url.startsWith("//")) url = "https:$url"
-            
+        return imgs.mapIndexed { index, img ->
+            val url = img.attr("src").ifBlank { img.attr("data-src") }
             var score = 0
-            val lowUrl = url.lowercase()
-            
-            if (preferredPatterns.any { lowUrl.contains(it) }) score += 100
-            if (ignorePatterns.any { lowUrl.contains(it) }) score -= 500
-            score += url.length / 5
-            
+            if (preferred.any { url.contains(it) }) score += 300
+            if (ignore.any { url.contains(it) }) score -= 1000
+            score += (10 - index) * 20
             url to score
-        }.sortedByDescending { it.second }
+        }.filter { it.second > 0 }.maxByOrNull { it.second }?.first ?: item.image
+    }
 
-        return sortedCandidates.firstOrNull { it.second > -100 }?.first
+    private suspend fun fetchOgpImage(url: String): String? = withContext(Dispatchers.IO) {
+        try {
+            val doc = org.jsoup.Jsoup.connect(url).timeout(3000).get()
+            doc.select("meta[property=og:image]").attr("content").takeIf { it.isNotBlank() }
+        } catch (e: Exception) { null }
     }
 
     fun fetchRss() {
@@ -219,12 +243,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             try {
                                 val channel = parser.getRssChannel(source.url)
                                 channel.items.map { item ->
+                                    val link = item.link ?: ""
+                                    var imageUrl = extractImageUrl(item)
+                                    if (imageUrl == null && link.isNotBlank()) {
+                                        imageUrl = fetchOgpImage(link)
+                                    }
                                     Article(
                                         title = item.title ?: "No Title",
-                                        link = item.link ?: "",
+                                        link = link,
                                         pubDate = formatDisplayDate(item.pubDate),
                                         sourceName = source.name,
-                                        imageUrl = extractImageUrl(item)
+                                        imageUrl = imageUrl
                                     )
                                 }
                             } catch (e: Exception) {
